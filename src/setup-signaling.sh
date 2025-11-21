@@ -22,6 +22,7 @@ declare -A SIGNALING_NC_SERVER_SECRETS          # Associative array
 declare -A SIGNALING_NC_SERVER_SESSIONLIMIT     # Associative array
 declare -A SIGNALING_NC_SERVER_MAXSTREAMBITRATE # Associative array
 declare -A SIGNALING_NC_SERVER_MAXSCREENBITRATE # Associative array
+declare -A SIGNALING_NC_SERVER_TIER             # Associative array for tier names
 
 # Helper function to check if a package needs rebuilding based on version
 # Usage: should_skip_build "marker_file" "current_version" "binary_path"
@@ -662,6 +663,7 @@ function signaling_step4() {
 	fi
 
 	# Process NEW domains (or all domains if fresh install)
+	local domain_index=0
 	for NC_SERVER in "${NEXTCLOUD_SERVER_FQDNS[@]}"; do
 		# Skip if domain already exists in ADD_DOMAINS_MODE with signaling selected
 		if [ "$ADD_DOMAINS_MODE" = true ] && [ "$ADD_DOMAINS_TO_SIGNALING" = true ]; then
@@ -670,6 +672,7 @@ function signaling_step4() {
 				if [ "$NC_SERVER" = "$existing_domain" ]; then
 					log "Skipping existing domain in Signaling: $NC_SERVER"
 					skip=true
+					domain_index=$(($domain_index + 1))
 					break
 				fi
 			done
@@ -681,26 +684,53 @@ function signaling_step4() {
 
 		NC_SERVER_UNDERSCORE=$(echo "$NC_SERVER" | sed "s/\./_/g")
 		SIGNALING_NC_SERVER_SECRETS[$NC_SERVER_UNDERSCORE]="$(openssl rand -hex 16)"
-		SIGNALING_NC_SERVER_SESSIONLIMIT[$NC_SERVER_UNDERSCORE]=0
-		SIGNALING_NC_SERVER_MAXSTREAMBITRATE[$NC_SERVER_UNDERSCORE]=0
-		SIGNALING_NC_SERVER_MAXSCREENBITRATE[$NC_SERVER_UNDERSCORE]=0
+
+		# Get tier for this domain
+		tier="${NEXTCLOUD_SERVER_TIERS[$domain_index]:-standard}"
+		tier_info=($(get_tier_limits "$tier"))
+		sessionlimit="${tier_info[0]}"
+		maxstreambitrate="${tier_info[1]}"
+		maxscreenbitrate="${tier_info[2]}"
+		tier_name="${tier_info[3]} ${tier_info[4]} ${tier_info[5]}"
+
+		SIGNALING_NC_SERVER_SESSIONLIMIT[$NC_SERVER_UNDERSCORE]=$sessionlimit
+		SIGNALING_NC_SERVER_MAXSTREAMBITRATE[$NC_SERVER_UNDERSCORE]=$maxstreambitrate
+		SIGNALING_NC_SERVER_MAXSCREENBITRATE[$NC_SERVER_UNDERSCORE]=$maxscreenbitrate
+		SIGNALING_NC_SERVER_TIER[$NC_SERVER_UNDERSCORE]="$tier_name"
+
+		log "Applying tier '$tier' to $NC_SERVER: sessions=$sessionlimit, stream=${maxstreambitrate}bps, screen=${maxscreenbitrate}bps"
 
 		SIGNALING_BACKENDS+=("nextcloud-backend-$i")
 
-		IFS= read -r -d '' SIGNALING_BACKEND_DEFINITION <<-EOF || true
-			[nextcloud-backend-$i]
-			url = https://$NC_SERVER
-			secret = ${SIGNALING_NC_SERVER_SECRETS["$NC_SERVER_UNDERSCORE"]}
-			#sessionlimit = ${SIGNALING_NC_SERVER_SESSIONLIMIT["$NC_SERVER_UNDERSCORE"]}
-			#maxstreambitrate = ${SIGNALING_NC_SERVER_MAXSTREAMBITRATE["$NC_SERVER_UNDERSCORE"]}
-			#maxscreenbitrate = ${SIGNALING_NC_SERVER_MAXSCREENBITRATE["$NC_SERVER_UNDERSCORE"]}
-		EOF
+		# Build config with or without commented lines based on whether limits are set
+		if [ "$sessionlimit" = "0" ] && [ "$maxstreambitrate" = "0" ] && [ "$maxscreenbitrate" = "0" ]; then
+			# Unlimited tier - keep lines commented
+			IFS= read -r -d '' SIGNALING_BACKEND_DEFINITION <<-EOF || true
+				[nextcloud-backend-$i]
+				url = https://$NC_SERVER
+				secret = ${SIGNALING_NC_SERVER_SECRETS["$NC_SERVER_UNDERSCORE"]}
+				#sessionlimit = 0
+				#maxstreambitrate = 0
+				#maxscreenbitrate = 0
+			EOF
+		else
+			# Tier with limits - uncomment lines
+			IFS= read -r -d '' SIGNALING_BACKEND_DEFINITION <<-EOF || true
+				[nextcloud-backend-$i]
+				url = https://$NC_SERVER
+				secret = ${SIGNALING_NC_SERVER_SECRETS["$NC_SERVER_UNDERSCORE"]}
+				sessionlimit = $sessionlimit
+				maxstreambitrate = $maxstreambitrate
+				maxscreenbitrate = $maxscreenbitrate
+			EOF
+		fi
 
 		# Escape newlines for sed later on.
 		SIGNALING_BACKEND_DEFINITION=$(echo "$SIGNALING_BACKEND_DEFINITION" | sed -z 's|\n|\\n|g')
 		SIGNALING_BACKEND_DEFINITIONS+=("$SIGNALING_BACKEND_DEFINITION")
 
 		i=$(($i + 1))
+		domain_index=$(($domain_index + 1))
 	done
 
 	# Don't actually *log* passwords! (Or do for debugging…)
@@ -810,7 +840,8 @@ function signaling_write_secrets_to_file() {
 
 			if [ "$is_new" = true ]; then
 				NC_SERVER_UNDERSCORE=$(echo "$NC_SERVER" | sed "s/\./_/g")
-				echo -e " - $NC_SERVER\t-> ${SIGNALING_NC_SERVER_SECRETS["$NC_SERVER_UNDERSCORE"]}" >>$1
+				tier_name="${SIGNALING_NC_SERVER_TIER[$NC_SERVER_UNDERSCORE]:-Unknown}"
+				echo -e " - $NC_SERVER\t-> ${SIGNALING_NC_SERVER_SECRETS["$NC_SERVER_UNDERSCORE"]} (Tier: $tier_name)" >>$1
 			fi
 		done
 	else
@@ -838,7 +869,8 @@ function signaling_write_secrets_to_file() {
 		# Write all domain secrets
 		for NC_SERVER in "${all_domains[@]}"; do
 			NC_SERVER_UNDERSCORE=$(echo "$NC_SERVER" | sed "s/\./_/g")
-			echo -e " - $NC_SERVER\t-> ${SIGNALING_NC_SERVER_SECRETS["$NC_SERVER_UNDERSCORE"]}" >>$1
+			tier_name="${SIGNALING_NC_SERVER_TIER[$NC_SERVER_UNDERSCORE]:-Unknown}"
+			echo -e " - $NC_SERVER\t-> ${SIGNALING_NC_SERVER_SECRETS["$NC_SERVER_UNDERSCORE"]} (Tier: $tier_name)" >>$1
 		done
 	fi
 }

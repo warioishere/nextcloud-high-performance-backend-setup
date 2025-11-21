@@ -11,6 +11,7 @@ ADD_DOMAINS_MODE=false           # Set to true to add domains to existing instal
 ADD_DOMAINS_TO_SIGNALING=false   # Add new domains to Signaling/Talk
 ADD_DOMAINS_TO_COLLABORA=false   # Add new domains to Collabora/Office
 NEXTCLOUD_SERVER_FQDNS=""  # Ask user
+NEXTCLOUD_SERVER_TIERS=""  # Comma-separated tier list (budget/standard/premium/unlimited)
 SERVER_FQDN=""             # Ask user
 SSL_CERT_PATH_RSA=""       # Will be auto filled, if not overriden by settings file.
 SSL_CERT_KEY_PATH_RSA=""   # Will be auto filled, if not overriden by settings file.
@@ -658,6 +659,70 @@ function parse_existing_global_secrets() {
 	fi
 }
 
+# Get tier limits for a given tier name
+# Usage: get_tier_limits "standard"
+# Returns: sessionlimit maxstreambitrate maxscreenbitrate tier_name
+function get_tier_limits() {
+	local tier="$1"
+	case "$tier" in
+		"budget")
+			echo "10 500000 750000 Budget (SD 480p)"
+			;;
+		"standard")
+			echo "20 1000000 1500000 Standard (HD 720p)"
+			;;
+		"premium")
+			echo "40 2000000 2500000 Premium (Full HD 1080p)"
+			;;
+		"unlimited")
+			echo "0 0 0 Unlimited (No Limits)"
+			;;
+		*)
+			log_err "Unknown tier: $tier"
+			echo "0 0 0 Unknown"
+			;;
+	esac
+}
+
+# Ask user to select tier for each domain (interactive mode)
+# Populates NEXTCLOUD_SERVER_TIERS array
+function ask_tier_selection() {
+	if [ "$UNATTENDED_INSTALL" = true ]; then
+		# In unattended mode, tiers should be provided via settings
+		return 0
+	fi
+
+	# Only ask for tiers if adding to Signaling
+	if [ "$ADD_DOMAINS_TO_SIGNALING" != true ] && [ "$SHOULD_INSTALL_SIGNALING" != true ]; then
+		return 0
+	fi
+
+	NEXTCLOUD_SERVER_TIERS=()
+
+	for NC_SERVER in "${NEXTCLOUD_SERVER_FQDNS[@]}"; do
+		TIER_CHOICE=$(whiptail --title "Select Tier for $NC_SERVER" --menu \
+			"Choose the resource tier for this Nextcloud instance:\n\n$(
+			)Budget tier limits video quality and concurrent sessions,\n$(
+			)while higher tiers allow better quality and more users." \
+			20 75 4 \
+			"1" "Budget     - SD 480p,  10 sessions,  500 Kbps video" \
+			"2" "Standard  - HD 720p,  20 sessions, 1000 Kbps video" \
+			"3" "Premium   - FHD 1080p, 40 sessions, 2000 Kbps video" \
+			"4" "Unlimited - No limits, unrestricted quality & users" \
+			3>&1 1>&2 2>&3 || echo "2")
+
+		case "$TIER_CHOICE" in
+			"1") NEXTCLOUD_SERVER_TIERS+=("budget") ;;
+			"2") NEXTCLOUD_SERVER_TIERS+=("standard") ;;
+			"3") NEXTCLOUD_SERVER_TIERS+=("premium") ;;
+			"4") NEXTCLOUD_SERVER_TIERS+=("unlimited") ;;
+			*) NEXTCLOUD_SERVER_TIERS+=("standard") ;;  # Default to standard
+		esac
+
+		log "Selected ${NEXTCLOUD_SERVER_TIERS[-1]} tier for $NC_SERVER"
+	done
+}
+
 function main() {
 	if [ -s "$LOGFILE_PATH" ]; then
 		rm -v $LOGFILE_PATH |& tee -a $LOGFILE_PATH
@@ -897,6 +962,26 @@ function main() {
 	NEXTCLOUD_SERVER_FQDNS=($(echo "$NEXTCLOUD_SERVER_FQDNS" | tr ',' ' '))
 	log "Splitting Nextcloud server domains into:"
 	log "$(printf '\t- %s\n' "${NEXTCLOUD_SERVER_FQDNS[@]}")"
+
+	# Parse or ask for tiers
+	if [ -n "$NEXTCLOUD_SERVER_TIERS" ]; then
+		# Transform tiers from comma-separated string to array
+		NEXTCLOUD_SERVER_TIERS=($(echo "$NEXTCLOUD_SERVER_TIERS" | tr ',' ' '))
+		log "Using provided tiers:"
+		for i in "${!NEXTCLOUD_SERVER_FQDNS[@]}"; do
+			tier="${NEXTCLOUD_SERVER_TIERS[$i]:-standard}"
+			log "  - ${NEXTCLOUD_SERVER_FQDNS[$i]}: $tier"
+		done
+	else
+		# Ask for tier selection interactively
+		ask_tier_selection
+	fi
+
+	# Ensure we have a tier for each domain (fill with 'standard' if missing)
+	while [ ${#NEXTCLOUD_SERVER_TIERS[@]} -lt ${#NEXTCLOUD_SERVER_FQDNS[@]} ]; do
+		NEXTCLOUD_SERVER_TIERS+=("standard")
+		log "Using default 'standard' tier for ${NEXTCLOUD_SERVER_FQDNS[${#NEXTCLOUD_SERVER_TIERS[@]}-1]}"
+	done
 
 	is_dry_run &&
 		log "Running in dry-mode. This script won't actually do anything on" \
