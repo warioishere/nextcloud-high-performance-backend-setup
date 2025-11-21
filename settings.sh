@@ -16,6 +16,12 @@ UNATTENDED_INSTALL=false
 # When enabled, existing secrets are preserved and only new domains get new secrets.
 ADD_DOMAINS_MODE=false
 
+# When in ADD_DOMAINS_MODE, specify which services should get the new domains:
+# Set to true to add new domains to Signaling / Nextcloud Talk
+ADD_DOMAINS_TO_SIGNALING=false
+# Set to true to add new domains to Collabora / Nextcloud Office
+ADD_DOMAINS_TO_COLLABORA=false
+
 # General settings
 # Leave empty, if you wish that the user will be asked about this.
 # You can also specify multiple Nextcloud servers by separating them with commas.

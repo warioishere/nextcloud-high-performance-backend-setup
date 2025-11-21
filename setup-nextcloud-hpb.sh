@@ -7,7 +7,9 @@ set -eo pipefail
 # See settings.sh
 DRY_RUN=false
 UNATTENDED_INSTALL=false
-ADD_DOMAINS_MODE=false      # Set to true to add domains to existing installation
+ADD_DOMAINS_MODE=false           # Set to true to add domains to existing installation
+ADD_DOMAINS_TO_SIGNALING=false   # Add new domains to Signaling/Talk
+ADD_DOMAINS_TO_COLLABORA=false   # Add new domains to Collabora/Office
 NEXTCLOUD_SERVER_FQDNS=""  # Ask user
 SERVER_FQDN=""             # Ask user
 SSL_CERT_PATH_RSA=""       # Will be auto filled, if not overriden by settings file.
@@ -759,11 +761,15 @@ function main() {
 		parse_existing_global_secrets
 
 		# Determine which services were previously installed
+		HAS_SIGNALING_INSTALLED=false
+		HAS_COLLABORA_INSTALLED=false
 		if [ -f "/etc/nextcloud-spreed-signaling/server.conf" ]; then
 			SHOULD_INSTALL_SIGNALING=true
+			HAS_SIGNALING_INSTALLED=true
 		fi
 		if [ -f "/etc/coolwsd/coolwsd.xml" ]; then
 			SHOULD_INSTALL_COLLABORA=true
+			HAS_COLLABORA_INSTALLED=true
 		fi
 		if systemctl is-enabled nginx &>/dev/null; then
 			SHOULD_INSTALL_NGINX=true
@@ -773,10 +779,63 @@ function main() {
 		fi
 
 		log "Detected installed services:"
-		[ "$SHOULD_INSTALL_SIGNALING" = true ] && log "  - Signaling"
-		[ "$SHOULD_INSTALL_COLLABORA" = true ] && log "  - Collabora"
+		[ "$SHOULD_INSTALL_SIGNALING" = true ] && log "  - Signaling (Talk)"
+		[ "$SHOULD_INSTALL_COLLABORA" = true ] && log "  - Collabora (Office)"
 		[ "$SHOULD_INSTALL_NGINX" = true ] && log "  - Nginx"
 		[ "$SHOULD_INSTALL_UFW" = true ] && log "  - UFW"
+
+		# Ask which service(s) to add domains to
+		if [ "$UNATTENDED_INSTALL" != true ]; then
+			# Build dynamic checklist based on installed services
+			CHECKLIST_ITEMS=()
+			CHECKLIST_COUNT=0
+
+			if [ "$HAS_SIGNALING_INSTALLED" = true ]; then
+				CHECKLIST_ITEMS+=("1" "Add domains to Signaling / Nextcloud Talk" "ON")
+				CHECKLIST_COUNT=$((CHECKLIST_COUNT + 1))
+			fi
+
+			if [ "$HAS_COLLABORA_INSTALLED" = true ]; then
+				CHECKLIST_ITEMS+=("2" "Add domains to Collabora / Nextcloud Office" "ON")
+				CHECKLIST_COUNT=$((CHECKLIST_COUNT + 1))
+			fi
+
+			if [ $CHECKLIST_COUNT -eq 0 ]; then
+				log_err "No services detected to add domains to!"
+				exit 1
+			fi
+
+			SERVICE_CHOICES=$(whiptail --title "Select Services for New Domains" --separate-output \
+				--checklist "Which service(s) should the new Nextcloud domains be added to?\n\n$(
+				)Use the space bar to select/deselect:" \
+				15 70 $CHECKLIST_COUNT "${CHECKLIST_ITEMS[@]}" 3>&1 1>&2 2>&3 || true)
+
+			if [ -z "$SERVICE_CHOICES" ]; then
+				log_err "No services were selected. Exiting..."
+				exit 0
+			fi
+
+			# Parse choices
+			for CHOICE in $SERVICE_CHOICES; do
+				case "$CHOICE" in
+				"1")
+					ADD_DOMAINS_TO_SIGNALING=true
+					log "Will add new domains to Signaling / Talk"
+					;;
+				"2")
+					ADD_DOMAINS_TO_COLLABORA=true
+					log "Will add new domains to Collabora / Office"
+					;;
+				esac
+			done
+		else
+			# In unattended mode, use values from settings
+			if [ "$ADD_DOMAINS_TO_SIGNALING" != true ] && [ "$ADD_DOMAINS_TO_COLLABORA" != true ]; then
+				log_err "In unattended ADD_DOMAINS_MODE, you must set either ADD_DOMAINS_TO_SIGNALING=true or ADD_DOMAINS_TO_COLLABORA=true"
+				exit 1
+			fi
+			log "Unattended mode: ADD_DOMAINS_TO_SIGNALING=$ADD_DOMAINS_TO_SIGNALING, ADD_DOMAINS_TO_COLLABORA=$ADD_DOMAINS_TO_COLLABORA"
+		fi
 	fi
 
 	# Let's check if we should open dialogs.

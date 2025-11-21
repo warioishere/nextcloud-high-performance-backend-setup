@@ -624,10 +624,10 @@ function signaling_step4() {
 	is_dry_run || chown -R turnserver:turnserver "$COTURN_DIR"
 	is_dry_run || chmod -R 740 "$COTURN_DIR"
 
-	# If in ADD_DOMAINS_MODE, start index after existing backends
-	if [ "$ADD_DOMAINS_MODE" = true ]; then
+	# If in ADD_DOMAINS_MODE and this service is selected, start index after existing backends
+	if [ "$ADD_DOMAINS_MODE" = true ] && [ "$ADD_DOMAINS_TO_SIGNALING" = true ]; then
 		i=${#EXISTING_NC_DOMAINS[@]}
-		log "Adding new domains to existing configuration (starting at index $i)"
+		log "Adding new domains to Signaling configuration (starting at index $i)"
 
 		# First, add existing domains to the arrays
 		local existing_i=0
@@ -663,12 +663,12 @@ function signaling_step4() {
 
 	# Process NEW domains (or all domains if fresh install)
 	for NC_SERVER in "${NEXTCLOUD_SERVER_FQDNS[@]}"; do
-		# Skip if domain already exists in ADD_DOMAINS_MODE
-		if [ "$ADD_DOMAINS_MODE" = true ]; then
+		# Skip if domain already exists in ADD_DOMAINS_MODE with signaling selected
+		if [ "$ADD_DOMAINS_MODE" = true ] && [ "$ADD_DOMAINS_TO_SIGNALING" = true ]; then
 			skip=false
 			for existing_domain in "${EXISTING_NC_DOMAINS[@]}"; do
 				if [ "$NC_SERVER" = "$existing_domain" ]; then
-					log "Skipping existing domain: $NC_SERVER"
+					log "Skipping existing domain in Signaling: $NC_SERVER"
 					skip=true
 					break
 				fi
@@ -676,7 +676,7 @@ function signaling_step4() {
 			if [ "$skip" = true ]; then
 				continue
 			fi
-			log "Adding new domain: $NC_SERVER"
+			log "Adding new domain to Signaling: $NC_SERVER"
 		fi
 
 		NC_SERVER_UNDERSCORE=$(echo "$NC_SERVER" | sed "s/\./_/g")
@@ -795,9 +795,9 @@ function signaling_write_secrets_to_file() {
 		return 0
 	fi
 
-	if [ "$ADD_DOMAINS_MODE" = true ]; then
+	if [ "$ADD_DOMAINS_MODE" = true ] && [ "$ADD_DOMAINS_TO_SIGNALING" = true ]; then
 		# In add-domains mode, append new domains to existing secrets file
-		echo -e "\n=== New Nextcloud Domains Added $(date +%Y-%m-%d) ===" >>$1
+		echo -e "\n=== New Nextcloud Domains Added to SIGNALING $(date +%Y-%m-%d) ===" >>$1
 		for NC_SERVER in "${NEXTCLOUD_SERVER_FQDNS[@]}"; do
 			# Check if this is a new domain
 			is_new=true
