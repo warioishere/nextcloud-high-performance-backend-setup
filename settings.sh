@@ -12,10 +12,32 @@ DRY_RUN=false
 # without any user input?
 UNATTENDED_INSTALL=false
 
+# Set to true to add new Nextcloud domains to an existing HPB installation.
+# When enabled, existing secrets are preserved and only new domains get new secrets.
+ADD_DOMAINS_MODE=false
+
+# When in ADD_DOMAINS_MODE, specify which services should get the new domains:
+# Set to true to add new domains to Signaling / Nextcloud Talk
+ADD_DOMAINS_TO_SIGNALING=false
+# Set to true to add new domains to Collabora / Nextcloud Office
+ADD_DOMAINS_TO_COLLABORA=false
+
 # General settings
 # Leave empty, if you wish that the user will be asked about this.
 # You can also specify multiple Nextcloud servers by separating them with commas.
 #NEXTCLOUD_SERVER_FQDNS="nextcloud.example.org"
+
+# Resource tiers for Nextcloud domains (used for Signaling/Talk limits)
+# Comma-separated list matching NEXTCLOUD_SERVER_FQDNS order
+# Available tiers: budget, standard, premium, unlimited
+# - budget:    SD 480p,  10 sessions,  500 Kbps video,  750 Kbps screen share
+# - standard:  HD 720p,  20 sessions, 1000 Kbps video, 1500 Kbps screen share
+# - premium:   FHD 1080p, 40 sessions, 2000 Kbps video, 2500 Kbps screen share
+# - unlimited: No limits on quality or concurrent sessions
+# Example: NEXTCLOUD_SERVER_TIERS="budget,standard,premium"
+# Leave empty to be asked interactively for each domain
+#NEXTCLOUD_SERVER_TIERS=""
+
 # Leave empty, if you wish that the user will be asked about this.
 #SERVER_FQDN="nc-workhorse.example.org"
 

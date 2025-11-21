@@ -7,7 +7,11 @@ set -eo pipefail
 # See settings.sh
 DRY_RUN=false
 UNATTENDED_INSTALL=false
+ADD_DOMAINS_MODE=false           # Set to true to add domains to existing installation
+ADD_DOMAINS_TO_SIGNALING=false   # Add new domains to Signaling/Talk
+ADD_DOMAINS_TO_COLLABORA=false   # Add new domains to Collabora/Office
 NEXTCLOUD_SERVER_FQDNS=""  # Ask user
+NEXTCLOUD_SERVER_TIERS=""  # Comma-separated tier list (budget/standard/premium/unlimited)
 SERVER_FQDN=""             # Ask user
 SSL_CERT_PATH_RSA=""       # Will be auto filled, if not overriden by settings file.
 SSL_CERT_KEY_PATH_RSA=""   # Will be auto filled, if not overriden by settings file.
@@ -72,12 +76,21 @@ function show_dialogs() {
 			exit 1
 		fi
 
+		local dialog_message="Please enter your Nextcloud server's domain name here. $(
+			)(Omit http(s)://, just put in the plain domain name!).\n\n$(
+			)You can also specify multiple Nextcloud servers by separating $(
+			)them using a comma."
+
+		if [ "$ADD_DOMAINS_MODE" = true ]; then
+			dialog_message="${dialog_message}\n\n$(
+				)${bold}Existing domains:${normal}\n$(
+				)$(printf '  - %s\n' "${EXISTING_NC_DOMAINS[@]}")\n$(
+				)Enter NEW domains to add:"
+		fi
+
 		NEXTCLOUD_SERVER_FQDNS=$(
 			whiptail --title "Nextcloud Server Domain" \
-				--inputbox "Please enter your Nextcloud server's domain name here. $(
-				)(Omit http(s)://, just put in the plain domain name!).\n\n$(
-				)You can also specify multiple Nextcloud servers by separating $(
-				)them using a comma." 12 65 \
+				--inputbox "$dialog_message" 18 65 \
 				"nextcloud.example.org" 3>&1 1>&2 2>&3
 		)
 	fi
@@ -86,20 +99,39 @@ function show_dialogs() {
 	log "Using '$NEXTCLOUD_SERVER_FQDNS' for NEXTCLOUD_SERVER_FQDNS".
 
 	if [ "$SERVER_FQDN" = "" ]; then
-		if [ "$UNATTENDED_INSTALL" = true ]; then
-			log_err "Can't continue since this is a non-interactive installation and I'm" \
-			        "missing SERVER_FQDN!"
-			exit 1
+		# In ADD_DOMAINS_MODE, try to detect SERVER_FQDN from existing configuration
+		if [ "$ADD_DOMAINS_MODE" = true ]; then
+			if [ -f "/etc/turnserver.conf" ]; then
+				SERVER_FQDN=$(grep "^realm=" /etc/turnserver.conf | sed 's/^realm=//' || true)
+				if [ -n "$SERVER_FQDN" ]; then
+					log "Detected SERVER_FQDN from existing configuration: $SERVER_FQDN"
+				fi
+			fi
 		fi
 
-		SERVER_FQDN=$(
-			whiptail --title "High-Performance Backend Server Domain" \
-				--inputbox "Please enter your high performance backend $(
+		# If still empty, ask the user
+		if [ "$SERVER_FQDN" = "" ]; then
+			if [ "$UNATTENDED_INSTALL" = true ]; then
+				log_err "Can't continue since this is a non-interactive installation and I'm" \
+				        "missing SERVER_FQDN!"
+				exit 1
+			fi
+
+			local message="Please enter your high performance backend $(
 				)server's domain name here. (Omit http(s)://!).\n\n$(
 				)Also please note that this domain should already exist in DNS $(
-				)or else SSL certificate creation will fail!" \
-				12 65 "nc-workhorse.example.org" 3>&1 1>&2 2>&3
-		)
+				)or else SSL certificate creation will fail!"
+
+			if [ "$ADD_DOMAINS_MODE" = true ]; then
+				message="Using existing HPB domain (read-only):"
+			fi
+
+			SERVER_FQDN=$(
+				whiptail --title "High-Performance Backend Server Domain" \
+					--inputbox "$message" \
+					12 65 "nc-workhorse.example.org" 3>&1 1>&2 2>&3
+			)
+		fi
 	fi
 	# Filter out HTTPS:// or HTTP://
 	SERVER_FQDN=$(echo $SERVER_FQDN | sed -r "s#https?\:\/\/##gi")
@@ -541,6 +573,156 @@ function announce_installation() {
 	sleep 1
 }
 
+# Check if HPB is already installed on this system
+function is_hpb_installed() {
+	# Check if key configuration files exist
+	if [ -f "/etc/nextcloud-spreed-signaling/server.conf" ] || \
+	   [ -f "/etc/coolwsd/coolwsd.xml" ]; then
+		return 0  # HPB is installed
+	else
+		return 1  # HPB is not installed
+	fi
+}
+
+# Parse existing Nextcloud domains from signaling configuration
+# Returns array of domains in EXISTING_NC_DOMAINS variable
+function parse_existing_domains() {
+	EXISTING_NC_DOMAINS=()
+
+	if [ ! -f "/etc/nextcloud-spreed-signaling/server.conf" ]; then
+		return 0
+	fi
+
+	# Extract domains from [nextcloud-backend-*] sections
+	while IFS= read -r line; do
+		if [[ "$line" =~ ^url[[:space:]]*=[[:space:]]*https://(.+)$ ]]; then
+			domain="${BASH_REMATCH[1]}"
+			EXISTING_NC_DOMAINS+=("$domain")
+		fi
+	done < "/etc/nextcloud-spreed-signaling/server.conf"
+
+	log "Found ${#EXISTING_NC_DOMAINS[@]} existing Nextcloud domain(s):"
+	for domain in "${EXISTING_NC_DOMAINS[@]}"; do
+		log "  - $domain"
+	done
+}
+
+# Parse existing secrets from signaling configuration
+# Populates EXISTING_NC_SERVER_SECRETS associative array
+function parse_existing_secrets() {
+	declare -g -A EXISTING_NC_SERVER_SECRETS
+
+	if [ ! -f "/etc/nextcloud-spreed-signaling/server.conf" ]; then
+		return 0
+	fi
+
+	local current_domain=""
+	while IFS= read -r line; do
+		# Match domain from url line
+		if [[ "$line" =~ ^url[[:space:]]*=[[:space:]]*https://(.+)$ ]]; then
+			current_domain="${BASH_REMATCH[1]}"
+		fi
+		# Match secret and associate with current domain
+		if [[ "$line" =~ ^secret[[:space:]]*=[[:space:]]*(.+)$ ]] && [ -n "$current_domain" ]; then
+			local secret="${BASH_REMATCH[1]}"
+			local domain_underscore=$(echo "$current_domain" | sed "s/\./_/g")
+			EXISTING_NC_SERVER_SECRETS["$domain_underscore"]="$secret"
+			log "Loaded existing secret for $current_domain"
+			current_domain=""
+		fi
+	done < "/etc/nextcloud-spreed-signaling/server.conf"
+}
+
+# Parse existing global secrets (Janus API key, hash key, block key, TURN secret)
+function parse_existing_global_secrets() {
+	if [ ! -f "/etc/nextcloud-spreed-signaling/server.conf" ]; then
+		return 0
+	fi
+
+	# Extract Janus API key
+	if grep -q "^secret = " /etc/janus/janus.transport.http.jcfg 2>/dev/null; then
+		SIGNALING_JANUS_API_KEY=$(grep "^secret = " /etc/janus/janus.transport.http.jcfg | head -n1 | sed 's/^secret = "\(.*\)"$/\1/')
+		log "Loaded existing Janus API key"
+	fi
+
+	# Extract hash and block keys
+	if [ -f "/etc/nextcloud-spreed-signaling/server.conf" ]; then
+		SIGNALING_HASH_KEY=$(grep "^hashkey = " /etc/nextcloud-spreed-signaling/server.conf | sed 's/^hashkey = //')
+		SIGNALING_BLOCK_KEY=$(grep "^blockkey = " /etc/nextcloud-spreed-signaling/server.conf | sed 's/^blockkey = //')
+		log "Loaded existing hash and block keys"
+	fi
+
+	# Extract TURN static auth secret
+	if [ -f "/etc/turnserver.conf" ]; then
+		SIGNALING_TURN_STATIC_AUTH_SECRET=$(grep "^static-auth-secret=" /etc/turnserver.conf | sed 's/^static-auth-secret=//')
+		log "Loaded existing TURN static auth secret"
+	fi
+}
+
+# Get tier limits for a given tier name
+# Usage: get_tier_limits "standard"
+# Returns: sessionlimit maxstreambitrate maxscreenbitrate tier_name
+function get_tier_limits() {
+	local tier="$1"
+	case "$tier" in
+		"budget")
+			echo "10 500000 750000 Budget (SD 480p)"
+			;;
+		"standard")
+			echo "20 1000000 1500000 Standard (HD 720p)"
+			;;
+		"premium")
+			echo "40 2000000 2500000 Premium (Full HD 1080p)"
+			;;
+		"unlimited")
+			echo "0 0 0 Unlimited (No Limits)"
+			;;
+		*)
+			log_err "Unknown tier: $tier"
+			echo "0 0 0 Unknown"
+			;;
+	esac
+}
+
+# Ask user to select tier for each domain (interactive mode)
+# Populates NEXTCLOUD_SERVER_TIERS array
+function ask_tier_selection() {
+	if [ "$UNATTENDED_INSTALL" = true ]; then
+		# In unattended mode, tiers should be provided via settings
+		return 0
+	fi
+
+	# Only ask for tiers if adding to Signaling
+	if [ "$ADD_DOMAINS_TO_SIGNALING" != true ] && [ "$SHOULD_INSTALL_SIGNALING" != true ]; then
+		return 0
+	fi
+
+	NEXTCLOUD_SERVER_TIERS=()
+
+	for NC_SERVER in "${NEXTCLOUD_SERVER_FQDNS[@]}"; do
+		TIER_CHOICE=$(whiptail --title "Select Tier for $NC_SERVER" --menu \
+			"Choose the resource tier for this Nextcloud instance:\n\n$(
+			)Budget tier limits video quality and concurrent sessions,\n$(
+			)while higher tiers allow better quality and more users." \
+			20 75 4 \
+			"1" "Budget     - SD 480p,  10 sessions,  500 Kbps video" \
+			"2" "Standard  - HD 720p,  20 sessions, 1000 Kbps video" \
+			"3" "Premium   - FHD 1080p, 40 sessions, 2000 Kbps video" \
+			"4" "Unlimited - No limits, unrestricted quality & users" \
+			3>&1 1>&2 2>&3 || echo "2")
+
+		case "$TIER_CHOICE" in
+			"1") NEXTCLOUD_SERVER_TIERS+=("budget") ;;
+			"2") NEXTCLOUD_SERVER_TIERS+=("standard") ;;
+			"3") NEXTCLOUD_SERVER_TIERS+=("premium") ;;
+			"4") NEXTCLOUD_SERVER_TIERS+=("unlimited") ;;
+			*) NEXTCLOUD_SERVER_TIERS+=("standard") ;;  # Default to standard
+		esac
+
+		log "Selected ${NEXTCLOUD_SERVER_TIERS[-1]} tier for $NC_SERVER"
+	done
+}
+
 function main() {
 	if [ -s "$LOGFILE_PATH" ]; then
 		rm -v $LOGFILE_PATH |& tee -a $LOGFILE_PATH
@@ -609,8 +791,120 @@ function main() {
 	fi
 	###
 
+	# Check if HPB is already installed
+	ADD_DOMAINS_MODE=false
+	if is_hpb_installed; then
+		log "${yellow}⚠ High-Performance Backend is already installed on this system!${normal}"
+
+		if [ "$UNATTENDED_INSTALL" != true ]; then
+			if whiptail --title "Add New Domains?" --yesno \
+				"The Nextcloud High-Performance Backend is already installed.\n\n$(
+				)Would you like to add new Nextcloud domains to the existing setup?\n\n$(
+				)Select 'Yes' to add new domains (keeps existing secrets)\n$(
+				)Select 'No' to exit" \
+				14 70 3>&1 1>&2 2>&3; then
+				ADD_DOMAINS_MODE=true
+				log "${green}Running in ADD DOMAINS mode - will preserve existing configuration${normal}"
+			else
+				log "User chose not to add domains. Exiting."
+				exit 0
+			fi
+		else
+			# In unattended mode, check if ADD_DOMAINS_MODE was set in settings
+			if [ "$ADD_DOMAINS_MODE" = true ]; then
+				log "${green}Running in ADD DOMAINS mode (unattended)${normal}"
+			else
+				log_err "HPB already installed. Set ADD_DOMAINS_MODE=true in settings to add domains."
+				exit 1
+			fi
+		fi
+
+		# Parse existing configuration
+		log "Parsing existing configuration..."
+		parse_existing_domains
+		parse_existing_secrets
+		parse_existing_global_secrets
+
+		# Determine which services were previously installed
+		HAS_SIGNALING_INSTALLED=false
+		HAS_COLLABORA_INSTALLED=false
+		if [ -f "/etc/nextcloud-spreed-signaling/server.conf" ]; then
+			SHOULD_INSTALL_SIGNALING=true
+			HAS_SIGNALING_INSTALLED=true
+		fi
+		if [ -f "/etc/coolwsd/coolwsd.xml" ]; then
+			SHOULD_INSTALL_COLLABORA=true
+			HAS_COLLABORA_INSTALLED=true
+		fi
+		if systemctl is-enabled nginx &>/dev/null; then
+			SHOULD_INSTALL_NGINX=true
+		fi
+		if systemctl is-enabled ufw &>/dev/null; then
+			SHOULD_INSTALL_UFW=true
+		fi
+
+		log "Detected installed services:"
+		[ "$SHOULD_INSTALL_SIGNALING" = true ] && log "  - Signaling (Talk)"
+		[ "$SHOULD_INSTALL_COLLABORA" = true ] && log "  - Collabora (Office)"
+		[ "$SHOULD_INSTALL_NGINX" = true ] && log "  - Nginx"
+		[ "$SHOULD_INSTALL_UFW" = true ] && log "  - UFW"
+
+		# Ask which service(s) to add domains to
+		if [ "$UNATTENDED_INSTALL" != true ]; then
+			# Build dynamic checklist based on installed services
+			CHECKLIST_ITEMS=()
+			CHECKLIST_COUNT=0
+
+			if [ "$HAS_SIGNALING_INSTALLED" = true ]; then
+				CHECKLIST_ITEMS+=("1" "Add domains to Signaling / Nextcloud Talk" "ON")
+				CHECKLIST_COUNT=$((CHECKLIST_COUNT + 1))
+			fi
+
+			if [ "$HAS_COLLABORA_INSTALLED" = true ]; then
+				CHECKLIST_ITEMS+=("2" "Add domains to Collabora / Nextcloud Office" "ON")
+				CHECKLIST_COUNT=$((CHECKLIST_COUNT + 1))
+			fi
+
+			if [ $CHECKLIST_COUNT -eq 0 ]; then
+				log_err "No services detected to add domains to!"
+				exit 1
+			fi
+
+			SERVICE_CHOICES=$(whiptail --title "Select Services for New Domains" --separate-output \
+				--checklist "Which service(s) should the new Nextcloud domains be added to?\n\n$(
+				)Use the space bar to select/deselect:" \
+				15 70 $CHECKLIST_COUNT "${CHECKLIST_ITEMS[@]}" 3>&1 1>&2 2>&3 || true)
+
+			if [ -z "$SERVICE_CHOICES" ]; then
+				log_err "No services were selected. Exiting..."
+				exit 0
+			fi
+
+			# Parse choices
+			for CHOICE in $SERVICE_CHOICES; do
+				case "$CHOICE" in
+				"1")
+					ADD_DOMAINS_TO_SIGNALING=true
+					log "Will add new domains to Signaling / Talk"
+					;;
+				"2")
+					ADD_DOMAINS_TO_COLLABORA=true
+					log "Will add new domains to Collabora / Office"
+					;;
+				esac
+			done
+		else
+			# In unattended mode, use values from settings
+			if [ "$ADD_DOMAINS_TO_SIGNALING" != true ] && [ "$ADD_DOMAINS_TO_COLLABORA" != true ]; then
+				log_err "In unattended ADD_DOMAINS_MODE, you must set either ADD_DOMAINS_TO_SIGNALING=true or ADD_DOMAINS_TO_COLLABORA=true"
+				exit 1
+			fi
+			log "Unattended mode: ADD_DOMAINS_TO_SIGNALING=$ADD_DOMAINS_TO_SIGNALING, ADD_DOMAINS_TO_COLLABORA=$ADD_DOMAINS_TO_COLLABORA"
+		fi
+	fi
+
 	# Let's check if we should open dialogs.
-	if [ "$UNATTENDED_INSTALL" != true ]; then
+	if [ "$UNATTENDED_INSTALL" != true ] && [ "$ADD_DOMAINS_MODE" != true ]; then
 		# Override settings file!
 		SHOULD_INSTALL_UFW=false
 		SHOULD_INSTALL_COLLABORA=false
@@ -668,6 +962,26 @@ function main() {
 	NEXTCLOUD_SERVER_FQDNS=($(echo "$NEXTCLOUD_SERVER_FQDNS" | tr ',' ' '))
 	log "Splitting Nextcloud server domains into:"
 	log "$(printf '\t- %s\n' "${NEXTCLOUD_SERVER_FQDNS[@]}")"
+
+	# Parse or ask for tiers
+	if [ -n "$NEXTCLOUD_SERVER_TIERS" ]; then
+		# Transform tiers from comma-separated string to array
+		NEXTCLOUD_SERVER_TIERS=($(echo "$NEXTCLOUD_SERVER_TIERS" | tr ',' ' '))
+		log "Using provided tiers:"
+		for i in "${!NEXTCLOUD_SERVER_FQDNS[@]}"; do
+			tier="${NEXTCLOUD_SERVER_TIERS[$i]:-standard}"
+			log "  - ${NEXTCLOUD_SERVER_FQDNS[$i]}: $tier"
+		done
+	else
+		# Ask for tier selection interactively
+		ask_tier_selection
+	fi
+
+	# Ensure we have a tier for each domain (fill with 'standard' if missing)
+	while [ ${#NEXTCLOUD_SERVER_TIERS[@]} -lt ${#NEXTCLOUD_SERVER_FQDNS[@]} ]; do
+		NEXTCLOUD_SERVER_TIERS+=("standard")
+		log "Using default 'standard' tier for ${NEXTCLOUD_SERVER_FQDNS[${#NEXTCLOUD_SERVER_TIERS[@]}-1]}"
+	done
 
 	is_dry_run &&
 		log "Running in dry-mode. This script won't actually do anything on" \
@@ -803,9 +1117,12 @@ function main() {
 	is_dry_run || touch "$SECRETS_FILE_PATH"
 	is_dry_run || chmod 0640 "$SECRETS_FILE_PATH"
 
-	echo -e "This file contains secrets, passwords and configuration" \
-		"generated by the Nextcloud High-Performance backend setup." \
-		>$SECRETS_FILE_PATH
+	# Only write header if not in ADD_DOMAINS_MODE (to avoid overwriting existing file)
+	if [ "$ADD_DOMAINS_MODE" != true ]; then
+		echo -e "This file contains secrets, passwords and configuration" \
+			"generated by the Nextcloud High-Performance backend setup." \
+			>$SECRETS_FILE_PATH
+	fi
 	# if [ "$SHOULD_INSTALL_UFW" = true ]; then
 	# 	ufw_write_secrets_to_file "$SECRETS_FILE_PATH"
 	# fi

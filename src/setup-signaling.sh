@@ -22,6 +22,7 @@ declare -A SIGNALING_NC_SERVER_SECRETS          # Associative array
 declare -A SIGNALING_NC_SERVER_SESSIONLIMIT     # Associative array
 declare -A SIGNALING_NC_SERVER_MAXSTREAMBITRATE # Associative array
 declare -A SIGNALING_NC_SERVER_MAXSCREENBITRATE # Associative array
+declare -A SIGNALING_NC_SERVER_TIER             # Associative array for tier names
 
 # Helper function to check if a package needs rebuilding based on version
 # Usage: should_skip_build "marker_file" "current_version" "binary_path"
@@ -624,30 +625,112 @@ function signaling_step4() {
 	is_dry_run || chown -R turnserver:turnserver "$COTURN_DIR"
 	is_dry_run || chmod -R 740 "$COTURN_DIR"
 
-	i=0
+	# If in ADD_DOMAINS_MODE and this service is selected, start index after existing backends
+	if [ "$ADD_DOMAINS_MODE" = true ] && [ "$ADD_DOMAINS_TO_SIGNALING" = true ]; then
+		i=${#EXISTING_NC_DOMAINS[@]}
+		log "Adding new domains to Signaling configuration (starting at index $i)"
+
+		# First, add existing domains to the arrays
+		local existing_i=0
+		for NC_SERVER in "${EXISTING_NC_DOMAINS[@]}"; do
+			NC_SERVER_UNDERSCORE=$(echo "$NC_SERVER" | sed "s/\./_/g")
+
+			# Use existing secret
+			SIGNALING_NC_SERVER_SECRETS[$NC_SERVER_UNDERSCORE]="${EXISTING_NC_SERVER_SECRETS[$NC_SERVER_UNDERSCORE]}"
+			SIGNALING_NC_SERVER_SESSIONLIMIT[$NC_SERVER_UNDERSCORE]=0
+			SIGNALING_NC_SERVER_MAXSTREAMBITRATE[$NC_SERVER_UNDERSCORE]=0
+			SIGNALING_NC_SERVER_MAXSCREENBITRATE[$NC_SERVER_UNDERSCORE]=0
+
+			SIGNALING_BACKENDS+=("nextcloud-backend-$existing_i")
+
+			IFS= read -r -d '' SIGNALING_BACKEND_DEFINITION <<-EOF || true
+				[nextcloud-backend-$existing_i]
+				url = https://$NC_SERVER
+				secret = ${SIGNALING_NC_SERVER_SECRETS["$NC_SERVER_UNDERSCORE"]}
+				#sessionlimit = ${SIGNALING_NC_SERVER_SESSIONLIMIT["$NC_SERVER_UNDERSCORE"]}
+				#maxstreambitrate = ${SIGNALING_NC_SERVER_MAXSTREAMBITRATE["$NC_SERVER_UNDERSCORE"]}
+				#maxscreenbitrate = ${SIGNALING_NC_SERVER_MAXSCREENBITRATE["$NC_SERVER_UNDERSCORE"]}
+			EOF
+
+			# Escape newlines for sed later on.
+			SIGNALING_BACKEND_DEFINITION=$(echo "$SIGNALING_BACKEND_DEFINITION" | sed -z 's|\n|\\n|g')
+			SIGNALING_BACKEND_DEFINITIONS+=("$SIGNALING_BACKEND_DEFINITION")
+
+			existing_i=$(($existing_i + 1))
+		done
+	else
+		i=0
+	fi
+
+	# Process NEW domains (or all domains if fresh install)
+	local domain_index=0
 	for NC_SERVER in "${NEXTCLOUD_SERVER_FQDNS[@]}"; do
+		# Skip if domain already exists in ADD_DOMAINS_MODE with signaling selected
+		if [ "$ADD_DOMAINS_MODE" = true ] && [ "$ADD_DOMAINS_TO_SIGNALING" = true ]; then
+			skip=false
+			for existing_domain in "${EXISTING_NC_DOMAINS[@]}"; do
+				if [ "$NC_SERVER" = "$existing_domain" ]; then
+					log "Skipping existing domain in Signaling: $NC_SERVER"
+					skip=true
+					domain_index=$(($domain_index + 1))
+					break
+				fi
+			done
+			if [ "$skip" = true ]; then
+				continue
+			fi
+			log "Adding new domain to Signaling: $NC_SERVER"
+		fi
+
 		NC_SERVER_UNDERSCORE=$(echo "$NC_SERVER" | sed "s/\./_/g")
 		SIGNALING_NC_SERVER_SECRETS[$NC_SERVER_UNDERSCORE]="$(openssl rand -hex 16)"
-		SIGNALING_NC_SERVER_SESSIONLIMIT[$NC_SERVER_UNDERSCORE]=0
-		SIGNALING_NC_SERVER_MAXSTREAMBITRATE[$NC_SERVER_UNDERSCORE]=0
-		SIGNALING_NC_SERVER_MAXSCREENBITRATE[$NC_SERVER_UNDERSCORE]=0
+
+		# Get tier for this domain
+		tier="${NEXTCLOUD_SERVER_TIERS[$domain_index]:-standard}"
+		tier_info=($(get_tier_limits "$tier"))
+		sessionlimit="${tier_info[0]}"
+		maxstreambitrate="${tier_info[1]}"
+		maxscreenbitrate="${tier_info[2]}"
+		tier_name="${tier_info[3]} ${tier_info[4]} ${tier_info[5]}"
+
+		SIGNALING_NC_SERVER_SESSIONLIMIT[$NC_SERVER_UNDERSCORE]=$sessionlimit
+		SIGNALING_NC_SERVER_MAXSTREAMBITRATE[$NC_SERVER_UNDERSCORE]=$maxstreambitrate
+		SIGNALING_NC_SERVER_MAXSCREENBITRATE[$NC_SERVER_UNDERSCORE]=$maxscreenbitrate
+		SIGNALING_NC_SERVER_TIER[$NC_SERVER_UNDERSCORE]="$tier_name"
+
+		log "Applying tier '$tier' to $NC_SERVER: sessions=$sessionlimit, stream=${maxstreambitrate}bps, screen=${maxscreenbitrate}bps"
 
 		SIGNALING_BACKENDS+=("nextcloud-backend-$i")
 
-		IFS= read -r -d '' SIGNALING_BACKEND_DEFINITION <<-EOF || true
-			[nextcloud-backend-$i]
-			url = https://$NC_SERVER
-			secret = ${SIGNALING_NC_SERVER_SECRETS["$NC_SERVER_UNDERSCORE"]}
-			#sessionlimit = ${SIGNALING_NC_SERVER_SESSIONLIMIT["$NC_SERVER_UNDERSCORE"]}
-			#maxstreambitrate = ${SIGNALING_NC_SERVER_MAXSTREAMBITRATE["$NC_SERVER_UNDERSCORE"]}
-			#maxscreenbitrate = ${SIGNALING_NC_SERVER_MAXSCREENBITRATE["$NC_SERVER_UNDERSCORE"]}
-		EOF
+		# Build config with or without commented lines based on whether limits are set
+		if [ "$sessionlimit" = "0" ] && [ "$maxstreambitrate" = "0" ] && [ "$maxscreenbitrate" = "0" ]; then
+			# Unlimited tier - keep lines commented
+			IFS= read -r -d '' SIGNALING_BACKEND_DEFINITION <<-EOF || true
+				[nextcloud-backend-$i]
+				url = https://$NC_SERVER
+				secret = ${SIGNALING_NC_SERVER_SECRETS["$NC_SERVER_UNDERSCORE"]}
+				#sessionlimit = 0
+				#maxstreambitrate = 0
+				#maxscreenbitrate = 0
+			EOF
+		else
+			# Tier with limits - uncomment lines
+			IFS= read -r -d '' SIGNALING_BACKEND_DEFINITION <<-EOF || true
+				[nextcloud-backend-$i]
+				url = https://$NC_SERVER
+				secret = ${SIGNALING_NC_SERVER_SECRETS["$NC_SERVER_UNDERSCORE"]}
+				sessionlimit = $sessionlimit
+				maxstreambitrate = $maxstreambitrate
+				maxscreenbitrate = $maxscreenbitrate
+			EOF
+		fi
 
 		# Escape newlines for sed later on.
 		SIGNALING_BACKEND_DEFINITION=$(echo "$SIGNALING_BACKEND_DEFINITION" | sed -z 's|\n|\\n|g')
 		SIGNALING_BACKEND_DEFINITIONS+=("$SIGNALING_BACKEND_DEFINITION")
 
 		i=$(($i + 1))
+		domain_index=$(($domain_index + 1))
 	done
 
 	# Don't actually *log* passwords! (Or do for debugging…)
@@ -742,26 +825,54 @@ function signaling_write_secrets_to_file() {
 		return 0
 	fi
 
-	echo -e "=== Signaling / Nextcloud Talk ===" >>$1
-	echo -e "Janus API key: $SIGNALING_JANUS_API_KEY" >>$1
-	echo -e "Hash key:      $SIGNALING_HASH_KEY" >>$1
-	echo -e "Block key:     $SIGNALING_BLOCK_KEY" >>$1
-	echo -e "" >>$1
-	echo -e "Allowed Nextcloud Servers:" >>$1
-	echo -e "$(printf '\t- https://%s\n' "${NEXTCLOUD_SERVER_FQDNS[@]}")" >>$1
-	echo -e "STUN server = $SERVER_FQDN:5349" >>$1
-	echo -e "TURN server:" >>$1
-	echo -e " - 'turn and turns'" >>$1
-	echo -e " - $SERVER_FQDN:5349" >>$1
-	echo -e " - $SIGNALING_TURN_STATIC_AUTH_SECRET" >>$1
-	echo -e " - 'udp & tcp'" >>$1
-	echo -e "High-performance backend:" >>$1
-	echo -e " - https://$SERVER_FQDN/standalone-signaling" >>$1
+	if [ "$ADD_DOMAINS_MODE" = true ] && [ "$ADD_DOMAINS_TO_SIGNALING" = true ]; then
+		# In add-domains mode, append new domains to existing secrets file
+		echo -e "\n=== New Nextcloud Domains Added to SIGNALING $(date +%Y-%m-%d) ===" >>$1
+		for NC_SERVER in "${NEXTCLOUD_SERVER_FQDNS[@]}"; do
+			# Check if this is a new domain
+			is_new=true
+			for existing_domain in "${EXISTING_NC_DOMAINS[@]}"; do
+				if [ "$NC_SERVER" = "$existing_domain" ]; then
+					is_new=false
+					break
+				fi
+			done
 
-	for NC_SERVER in "${NEXTCLOUD_SERVER_FQDNS[@]}"; do
-		NC_SERVER_UNDERSCORE=$(echo "$NC_SERVER" | sed "s/\./_/g")
-		echo -e " - $NC_SERVER\t-> ${SIGNALING_NC_SERVER_SECRETS["$NC_SERVER_UNDERSCORE"]}" >>$1
-	done
+			if [ "$is_new" = true ]; then
+				NC_SERVER_UNDERSCORE=$(echo "$NC_SERVER" | sed "s/\./_/g")
+				tier_name="${SIGNALING_NC_SERVER_TIER[$NC_SERVER_UNDERSCORE]:-Unknown}"
+				echo -e " - $NC_SERVER\t-> ${SIGNALING_NC_SERVER_SECRETS["$NC_SERVER_UNDERSCORE"]} (Tier: $tier_name)" >>$1
+			fi
+		done
+	else
+		# Fresh install mode - write complete secrets file
+		echo -e "=== Signaling / Nextcloud Talk ===" >>$1
+		echo -e "Janus API key: $SIGNALING_JANUS_API_KEY" >>$1
+		echo -e "Hash key:      $SIGNALING_HASH_KEY" >>$1
+		echo -e "Block key:     $SIGNALING_BLOCK_KEY" >>$1
+		echo -e "" >>$1
+		echo -e "Allowed Nextcloud Servers:" >>$1
+
+		# Combine all domains (existing + new) for output
+		all_domains=("${EXISTING_NC_DOMAINS[@]}" "${NEXTCLOUD_SERVER_FQDNS[@]}")
+		echo -e "$(printf '\t- https://%s\n' "${all_domains[@]}")" >>$1
+
+		echo -e "STUN server = $SERVER_FQDN:5349" >>$1
+		echo -e "TURN server:" >>$1
+		echo -e " - 'turn and turns'" >>$1
+		echo -e " - $SERVER_FQDN:5349" >>$1
+		echo -e " - $SIGNALING_TURN_STATIC_AUTH_SECRET" >>$1
+		echo -e " - 'udp & tcp'" >>$1
+		echo -e "High-performance backend:" >>$1
+		echo -e " - https://$SERVER_FQDN/standalone-signaling" >>$1
+
+		# Write all domain secrets
+		for NC_SERVER in "${all_domains[@]}"; do
+			NC_SERVER_UNDERSCORE=$(echo "$NC_SERVER" | sed "s/\./_/g")
+			tier_name="${SIGNALING_NC_SERVER_TIER[$NC_SERVER_UNDERSCORE]:-Unknown}"
+			echo -e " - $NC_SERVER\t-> ${SIGNALING_NC_SERVER_SECRETS["$NC_SERVER_UNDERSCORE"]} (Tier: $tier_name)" >>$1
+		done
+	fi
 }
 
 function signaling_print_info() {
