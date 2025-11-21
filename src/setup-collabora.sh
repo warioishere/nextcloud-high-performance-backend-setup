@@ -111,7 +111,30 @@ function collabora_step4() {
 	# 4. Prepare configuration
 	log "\n${green}Step 4: Prepare configuration"
 
-	for NC_SERVER in "${NEXTCLOUD_SERVER_FQDNS[@]}"; do
+	# If in ADD_DOMAINS_MODE, include existing domains first
+	declare -a all_nc_servers
+	if [ "$ADD_DOMAINS_MODE" = true ]; then
+		log "Including existing Nextcloud domains in Collabora configuration"
+		all_nc_servers=("${EXISTING_NC_DOMAINS[@]}")
+
+		# Add new domains that don't already exist
+		for NC_SERVER in "${NEXTCLOUD_SERVER_FQDNS[@]}"; do
+			is_new=true
+			for existing_domain in "${EXISTING_NC_DOMAINS[@]}"; do
+				if [ "$NC_SERVER" = "$existing_domain" ]; then
+					is_new=false
+					break
+				fi
+			done
+			if [ "$is_new" = true ]; then
+				all_nc_servers+=("$NC_SERVER")
+			fi
+		done
+	else
+		all_nc_servers=("${NEXTCLOUD_SERVER_FQDNS[@]}")
+	fi
+
+	for NC_SERVER in "${all_nc_servers[@]}"; do
 		IFS= read -r -d '' COLLABORA_HOST_DEFINITION <<EOF || true
 				<group>
 					<host desc="hostname to allow or deny." allow="true">https://$NC_SERVER:443</host>
@@ -128,7 +151,7 @@ EOF
 	sed -ri "s|<COLLABORA_HOST_DEFINITIONS>|${COLLABORA_HOST_DEFINITIONS[*]}|g" "$TMP_DIR_PATH"/collabora/*
 	unset IFS
 
-	for NC_SERVER in "${NEXTCLOUD_SERVER_FQDNS[@]}"; do
+	for NC_SERVER in "${all_nc_servers[@]}"; do
 		IFS= read -r -d '' COLLABORA_REMOTE_FONT_CONFIG <<EOF || true
 				<url desc="URL of optional JSON file that lists fonts to be included in Online" type="string" default="">https://$NC_SERVER/apps/richdocuments/settings/fonts.json</url>
 EOF

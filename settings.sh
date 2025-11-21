@@ -12,6 +12,10 @@ DRY_RUN=false
 # without any user input?
 UNATTENDED_INSTALL=false
 
+# Set to true to add new Nextcloud domains to an existing HPB installation.
+# When enabled, existing secrets are preserved and only new domains get new secrets.
+ADD_DOMAINS_MODE=false
+
 # General settings
 # Leave empty, if you wish that the user will be asked about this.
 # You can also specify multiple Nextcloud servers by separating them with commas.
